@@ -1,0 +1,98 @@
+"""
+FlyVisRL - Training Script
+Trains a PPO agent on the RobustVisionFlyEnv environment.
+"""
+
+import os
+import gym
+import torch
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+from stable_baselines3.common.monitor import Monitor
+from env.robust_env import RobustVisionFlyEnv
+
+
+def make_env(seed=42):
+    """Create and wrap the environment."""
+    def _init():
+        env = RobustVisionFlyEnv(
+            terrain_types=['gap', 'blocks', 'mixed'],
+            randomize_physics=True,
+            add_visual_noise=True,
+            max_steps=10000,  # Adjust based on your compute
+            seed=seed
+        )
+        env = Monitor(env)  # Record episode stats
+        return env
+    return _init
+
+
+def main():
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    
+    # Create vectorized environment (1 env is fine for start)
+    env = DummyVecEnv([make_env(seed=42)])
+    
+    # Evaluation environment (no domain randomization for fair eval)
+    eval_env = DummyVecEnv([make_env(seed=123)])
+    
+    # Define model save path
+    log_dir = "logs/"
+    model_dir = "models/"
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(model_dir, exist_ok=True)
+    
+    # Callbacks: save best model and regular checkpoints
+    checkpoint_callback = CheckpointCallback(
+        save_freq=50000,  # Save every 50k steps
+        save_path=model_dir,
+        name_prefix="ppo_fly"
+    )
+    
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=model_dir,
+        log_path=log_dir,
+        eval_freq=20000,      # Evaluate every 20k steps
+        deterministic=True,
+        render=False,
+        n_eval_episodes=5     # Run 5 episodes per eval
+    )
+    
+    # Initialize PPO agent
+    model = PPO(
+        "MlpPolicy",
+        env,
+        learning_rate=3e-4,
+        n_steps=2048,
+        batch_size=64,
+        n_epochs=10,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.01,
+        verbose=1,
+        tensorboard_log=log_dir if os.getenv("ENABLE_TENSORBOARD") else None
+    )
+    
+    print("🚀 Starting training...")
+    print(f"Observation space: {env.observation_space}")
+    print(f"Action space: {env.action_space}")
+    
+    # Train!
+    total_timesteps = 2_000_000  # 2 million steps (adjust as needed)
+    model.learn(
+        total_timesteps=total_timesteps,
+        callback=[checkpoint_callback, eval_callback],
+        progress_bar=True
+    )
+    
+    # Save final model
+    model.save(os.path.join(model_dir, "ppo_fly_final"))
+    print("✅ Training finished! Model saved to models/ppo_fly_final.zip")
+
+
+if __name__ == "__main__":
+    main()
