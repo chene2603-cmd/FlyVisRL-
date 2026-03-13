@@ -1,0 +1,191 @@
+---
+
+#### 5. 文件名：`env/robust_env.py`
+> 这是你修复后的核心环境代码（已包含神经元数据输出）
+
+```python
+import gym
+from gym import spaces
+import numpy as np
+from flygym import SingleFlySimulation
+from flygym.examples.vision import RealisticVisionFly
+from flygym.arena import GappedTerrain, BlocksTerrain, MixedTerrain
+from scipy.spatial.transform import Rotation as R
+import random
+
+class RobustVisionFlyEnv(gym.Env):
+    """
+    Multi-task, domain-randomized vision-guided fruit fly environment.
+    """
+    def __init__(self,
+                 terrain_types=['gap', 'blocks', 'mixed'],
+                 randomize_physics=True,
+                 add_visual_noise=True,
+                 reward_weights=None,
+                 max_steps=20000,
+                 timestep=1e-4,
+                 seed=None):
+        super().__init__()
+        self.terrain_types = terrain_types
+        self.randomize_physics = randomize_physics
+        self.add_visual_noise = add_visual_noise
+        self.max_steps = max_steps
+        self.timestep = timestep
+        self.seed = seed
+        if seed is not None:
+            np.random.seed(seed)
+            random.seed(seed)
+        
+        self.reward_weights = reward_weights if reward_weights else [1.0, 0.005, 0.1, 0.01]
+        self.fly = None
+        self.sim = None
+        self.last_pos = None
+        self.last_joint_pos = None
+        self.current_terrain = None
+        self.current_params = {}
+        self.n_joints = None
+        self.observation_space = None
+        self.action_space = None
+
+    def _create_fly(self):
+        if self.randomize_physics:
+            damping = np.random.uniform(0.8, 1.2)
+            stiffness = np.random.uniform(0.8, 1.2)
+            fly = RealisticVisionFly(
+                enable_vision=True,
+                head_stabilization_model="thorax",
+                damping=damping,
+                stiffness=stiffness,
+                name="fly"
+            )
+        else:
+            fly = RealisticVisionFly(enable_vision=True, head_stabilization_model="thorax", name="fly")
+        return fly
+
+    def _create_arena(self, terrain_type):
+        params = {}
+        if terrain_type == 'gap':
+            gap_width = np.random.uniform(0.002, 0.02)
+            gap_spacing = np.random.uniform(0.02, 0.03)
+            params = {'gap_width': gap_width, 'gap_spacing': gap_spacing}
+            arena = GappedTerrain(gap_width=gap_width, gap_spacing=gap_spacing)
+        elif terrain_type == 'blocks':
+            block_width = 0.01
+            height_range = (0.0, np.random.uniform(0.005, 0.02))
+            density = np.random.uniform(0.4, 0.8)
+            params = {'block_width': block_width, 'height_range': height_range, 'density': density}
+            arena = BlocksTerrain(block_width=block_width, height_range=height_range, density=density)
+        elif terrain_type == 'mixed':
+            gap_width = np.random.uniform(0.002, 0.015)
+            gap_spacing = np.random.uniform(0.02, 0.03)
+            block_width = 0.01
+            block_height = np.random.uniform(0.005, 0.015)
+            density = np.random.uniform(0.4, 0.7)
+            params = {
+                'gap_width': gap_width, 'gap_spacing': gap_spacing,
+                'block_width': block_width,
+                'height_range': (0.0, block_height),
+                'density': density
+            }
+            arena = MixedTerrain(
+                gap_width=gap_width, gap_spacing=gap_spacing,
+                block_width=block_width, height_range=(0.0, block_height),
+                density=density
+            )
+        else:
+            raise ValueError(f"Unknown terrain type: {terrain_type}")
+        return arena, params
+
+    def reset(self):
+        if self.sim is not None:
+            self.sim.close()
+        
+        self.current_terrain = np.random.choice(self.terrain_types)
+        arena, self.current_params = self._create_arena(self.current_terrain)
+        self.fly = self._create_fly()
+        self.sim = SingleFlySimulation(fly=self.fly, arena=arena, timestep=self.timestep)
+        obs, info = self.sim.reset()
+        
+        if self.n_joints is None:
+            self.n_joints = len(self.fly.actuated_joints)
+            t4a_dim = 2 * 721
+            obs_dim = t4a_dim + self.n_joints + 2
+            self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
+            self.action_space = spaces.Box(low=-0.3, high=0.3, shape=(self.n_joints,), dtype=np.float32)
+        
+        self.current_step = 0
+        self.last_pos = obs["fly"][:3].copy()
+        self.last_joint_pos = info["fly"]["joints"]["pos"].copy()
+        return self._get_obs(obs, info)
+
+    def step(self, action):
+        current_joints = self.sim.get_joint_positions()
+        target_joints = current_joints + np.clip(action, -0.3, 0.3)
+        obs, _, terminated, truncated, info = self.sim.step({
+            "joints": target_joints,
+            "adhesion": np.ones(6, dtype=np.int32)
+        })
+        self.current_step += 1
+        
+        pos = obs["fly"][:3]
+        delta_pos = pos - self.last_pos
+        forward_vel = np.linalg.norm(delta_pos[:2]) / self.timestep  # 只取 x,y 方向
+        self.last_pos = pos.copy()
+        
+        torque = info["fly"]["joints"]["torque"]
+        joint_vel = (info["fly"]["joints"]["pos"] - self.last_joint_pos) / self.timestep
+        power = np.sum(torque * joint_vel)
+        self.last_joint_pos = info["fly"]["joints"]["pos"].copy()
+        
+        quat = obs["fly"][3:7]
+        roll, pitch, _ = self._quat_to_euler(quat)
+        contacts = info["fly"]["end_effectors"]["contact"]
+        n_contact = np.sum(contacts)
+        fallen = (abs(pitch) > 0.5 or abs(roll) > 0.5) and n_contact < 3
+
+        if fallen:
+            reward = -50.0
+            terminated = True
+        else:
+            w_vel, w_energy, w_balance, w_alive = self.reward_weights
+            reward = (w_vel * forward_vel
+                      - w_energy * max(0, power)
+                      - w_balance * (abs(roll) + abs(pitch))
+                      + w_alive)
+        
+        truncated = self.current_step >= self.max_steps
+        done = terminated or truncated
+        
+        info.update({
+            'terrain_type': self.current_terrain,
+            'terrain_params': self.current_params,
+            'forward_vel': forward_vel,
+            'power': power,
+            'fallen': fallen,
+            'roll': roll,
+            'pitch': pitch,
+            'contact': contacts,
+            'nn_activities': info["fly"]["nn_activities"]  # 关键修复：传出神经元数据
+        })
+        
+        return self._get_obs(obs, info), reward, done, info
+
+    def _get_obs(self, obs, info):
+        nn_act = info["fly"]["nn_activities"]
+        assert 'T4a' in nn_act, f"Available keys: {list(nn_act.keys())}"
+        t4a = nn_act['T4a'].flatten().astype(np.float32)
+        if self.add_visual_noise:
+            t4a += np.random.normal(0, 0.05, size=t4a.shape).astype(np.float32)
+        joint_pos = info["fly"]["joints"]["pos"].astype(np.float32)
+        quat = obs["fly"][3:7]
+        roll, pitch, _ = self._quat_to_euler(quat)
+        extra = np.array([roll, pitch], dtype=np.float32)
+        return np.concatenate([t4a, joint_pos, extra])
+
+    def _quat_to_euler(self, quat):
+        r = R.from_quat(quat)
+        return r.as_euler('xyz', degrees=False)
+
+    def render(self, mode='human'):
+        if self.sim is not None:
+            self.sim.render()
